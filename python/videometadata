@@ -1,0 +1,273 @@
+#!/usr/bin/env python3
+#
+# videometadata, a video metadata display for Ubuntu-MATE Caja-actions
+# Copyright (c) 2016 Mario Figueiredo
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+"""Read and retrieve metadata information from video files.
+
+Currently supports the following video containers:
+
+    * RIFF (Resource Interchange File Format)
+        The usual container of .AVI files.
+    * Matroska (Matroska Multimedia Container)
+        Associated with .MKV files. An open format usually associated with H.264
+        and H.265 encoded files.
+    * MP4 (MPEG-4 Part 14)
+        An extension of the QuickTime File Format associated with MP4 files.
+
+External dependencies:
+
+    exiftool
+
+"""
+
+import sys
+import json
+import re
+import subprocess
+import shutil
+import argparse
+from pathlib import Path
+
+
+def is_available():
+    """Checks if the exiftool program exists in the user system.
+
+    Returns:
+        True, if the exiftool application exists. False otherwise.
+    """
+    return bool(shutil.which('exiftool'))
+
+
+def version():
+    """Returns the exiftool version number.
+
+    Returns:
+        A tuple with the version number (major, minor, revision), or None if the
+        exiftool program isn't available on this system.
+    """
+    if not is_available():
+        return None
+
+    ver = subprocess.run(['exiftool', '-ver'],
+                         stdout=subprocess.PIPE,
+                         universal_newlines=True)
+    ver = map(int, ver.stdout.strip().split('.'))
+
+    return tuple(ver)
+
+
+def process_riff(meta):
+    """Reads and processes RIFF metadata.
+
+    Note:
+        RIFF apparently does not support multiple video and audio tracks.
+        It does not support subtitle tracks either.
+    """
+
+    # exiftool calculates a composite Duration tag for the RIFF format. But it
+    # is unreliable on my version of exiftool (v10.10). This way is better.
+    #
+    # :TODO: Keep checking exiftool RIFF duration tag compatibility.
+    fcount = int(meta['RIFF']['VideoFrameCount'])
+    frate = float(meta['RIFF']['VideoFrameRate'])
+
+    hours, remainder = divmod(int(fcount // frate), 3600)
+    minutes, seconds = divmod(remainder, 60)
+
+    fileinfo['duration'] = '%s:%s:%s' % (hours, minutes, seconds)
+
+    fileinfo['width'] = int(meta['RIFF']['ImageWidth'])
+    fileinfo['height'] = int(meta['RIFF']['ImageHeight'])
+    fileinfo['codec'] = meta['RIFF']['VideoCodec']
+    fileinfo['bitdepth'] = int(meta['File']['BitDepth'])
+    fileinfo['samplerate'] = int(meta['RIFF']['SampleRate'])
+    fileinfo['framerate'] = float(meta['RIFF']['VideoFrameRate'])
+
+    fileinfo['audio'].append({'name': '',
+                              'language': '',
+                              'codec': meta['RIFF']['Encoding'],
+                              'channels': int(meta['RIFF']['NumChannels']),
+                              'samplerate': float(meta['RIFF']['AudioSampleRate'])})
+
+
+def process_matroska(meta):
+    """Reads and processes Matroska metadata.
+
+    Notes:
+        bitdepth and samplerate aren't supported.
+    """
+
+    fileinfo['duration'] = meta['Matroska']['Duration']
+
+    for tag in meta:
+        if not tag.startswith('Track'):
+            continue
+        if meta[tag]['TrackType'] == 'Video':
+
+            fileinfo['width'] = int(meta[tag]['ImageWidth'])
+            fileinfo['height'] = int(meta[tag]['ImageHeight'])
+            fileinfo['codec'] = meta[tag]['VideoCodecID']
+            fileinfo['framerate'] = float(meta[tag]['VideoFrameRate'])
+
+        elif meta[tag]['TrackType'] == 'Audio':
+
+            tname = meta[tag]['TrackName'] if 'TrackName' in meta[tag] else ''
+            lang = meta[tag]['TrackLanguage'] if 'TrackLanguage' in meta[tag] else ''
+            lang = '' if lang == 'und' else lang
+
+            if 'OutputAudioSampleRate' in meta[tag]:
+                asr = meta[tag]['OutputAudioSampleRate']
+            else:
+                asr = meta[tag]['AudioSampleRate']
+
+            fileinfo['audio'].append({'name': tname,
+                                      'language': lang,
+                                      'codec': meta[tag]['AudioCodecID'],
+                                      'channels': int(meta[tag]['AudioChannels']),
+                                      'samplerate': int(asr)})
+
+
+def process_mp4(meta):
+    """Reads and processes MP4 metadata.
+
+    Notes:
+        samplerate not supported.
+    """
+
+    fileinfo['duration'] = meta['QuickTime']['Duration']
+
+    for tag in meta:
+        if not tag.startswith('Track'):
+            continue
+        if meta[tag]['HandlerType'].startswith('Video'):
+
+            fileinfo['width'] = int(meta[tag]['ImageWidth'])
+            fileinfo['height'] = int(meta[tag]['ImageHeight'])
+            fileinfo['codec'] = meta[tag]['CompressorID']
+            fileinfo['bitdepth'] = int(meta[tag]['BitDepth'])
+            fileinfo['framerate'] = float(meta[tag]['VideoFrameRate'])
+
+        elif meta[tag]['HandlerType'].startswith('Audio'):
+
+            tname = meta[tag]['%sName' % tag] if '%sName' % tag in meta[tag] else ''
+            lang = meta[tag]['MediaLanguageCode'] if 'MediaLanguageCode' in meta[tag] else ''
+            lang = '' if lang == 'und' else lang
+
+            fileinfo['audio'].append({'name':       tname,
+                                      'language':   lang,
+                                      'codec':      meta[tag]['AudioFormat'],
+                                      'channels':   int(meta[tag]['AudioChannels']),
+                                      'samplerate': int(meta[tag]['AudioSampleRate'])})
+
+
+if __name__ == '__main__':
+
+    # Currently supported video containers
+    containermap = {'x-msvideo':  ('RIFF', process_riff),
+                    'x-matroska': ('Matroska', process_matroska),
+                    'mp4':        ('QuickTime', process_mp4)}
+
+    videocodecmap = {'AVC1':             'H.264/MPEG-4 AVC',
+                     'V_MPEG4/ISO/AVC':  'H.264/MPEG-4 AVC',
+                     'H.264':            'H.264/MPEG-4 AVC',
+                     'V_MPEGH/ISO/HEVC': 'H.265/HEVC',
+                     'XVID':             'Xvid',
+                     'DX50':             'DivX 5'}
+
+    audiocodecmap = {'MP4A':                'MPEG-4/AAC',
+                     'MP3':                 'MPEG Audio Layer III',
+                     'A_AC3':               'Dolby Digital',
+                     'A_VORBIS':            'Vorbis Audio',
+                     'A_DTS':               'DTS Audio',
+                     'A_AAC':               'MPEG-4/AAC Audio',
+                     'FAST MULTIMEDIA DVM': 'Dolby Digital'}
+
+    # parsed metadata information
+    fileinfo = {'filepath':   '',
+                'container':  '',
+                'duration:':   0,
+                'width':       0,
+                'height':      0,
+                'codec':      '',
+                'bitdepth':    0,
+                'samplerate':  0,
+                'framerate':   0,
+                'audio':      [],
+                'warnings':   ''}
+
+    description = 'Read and retrieve metadata information from video files'
+    parser = argparse.ArgumentParser(description=description, usage='%(prog)s filepath')
+    parser.add_argument('filepath', help='a valid path to a video file.')
+    args = parser.parse_args()
+
+    if not is_available():
+        sys.exit("Error: The exiftool program is not installed on this system. Can't proceeed...")
+
+    if not Path(args.filepath).exists():
+        sys.exit('Error: File not found: %s' % args.filepath)
+
+    data = subprocess.run('exiftool -g1 -s -sort -ALL -j'.split() + [args.filepath],
+                          stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE,
+                          universal_newlines=True)
+
+    if data.returncode:
+        msg = data.stderr or json.loads(data.stdout)[0]['ExifTool']['Error']
+        sys.exit('Error: exiftool reported the error: %s' % msg)
+
+    try:
+        mimesubtype = re.search('mimetype": "video/(.+?)"', data.stdout, re.IGNORECASE).group(1).lower()
+    except AttributeError:
+        sys.exit('Error: file is not a video file.')
+
+    if mimesubtype not in containermap:
+        sys.exit('Error: Video container not implemented yet (%s) ' % mimesubtype)
+
+    fileinfo['filepath'] = args.filepath
+    fileinfo['container'] = containermap[mimesubtype][0]
+    fileinfo['warnings'] = data.stderr
+
+    data = json.loads(data.stdout)[0]
+    process_metadata = containermap[mimesubtype][1]
+    process_metadata(data)
+
+    result = '--- %s ---\n\n' % Path(fileinfo['filepath']).name
+
+    result += 'Image Size:\n\t%sx%s\n' % (fileinfo['width'], fileinfo['height'])
+    result += 'Duration:\n\t%s\n' % fileinfo['duration']
+
+    result += 'Container:\n\t%s\n' % fileinfo['container']
+    result += 'Codec:\n\t%s\n' % videocodecmap[fileinfo['codec'].upper()]
+    if fileinfo['bitdepth']:
+        result += 'Bit Depth:\n\t%s\n' % fileinfo['bitdepth']
+    if fileinfo['samplerate']:
+        result += 'Sample Rate:\n\t%s Hz\n' % fileinfo['samplerate']
+    result += 'Frame Rate:\n\t%s\n' % fileinfo['framerate']
+
+    result += 'Audio:\n'
+    for ix, track in enumerate(fileinfo['audio']):
+        result += '\t(%02d) (%s) Track Name: %s\n' % (ix + 1, track['language'], track['name'])
+        result += '\t\tCodec: %s\n' % audiocodecmap[track['codec'].upper()]
+        result += '\t\tChannels: %2d, ' % track['channels']
+        result += 'SampleRate: %6d Hz\n' % track['samplerate']
+
+    print(result)
